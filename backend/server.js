@@ -3,6 +3,13 @@ import { parse } from 'json2csv';
 import { request, gql } from 'graphql-request';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import cors from "cors";
+import csv from "csv-parser";
+import express from 'express';
+import path from 'path';
+
+// Define __dirname for ES modules
+const __dirname = new URL('.', import.meta.url).pathname;
 
 dotenv.config();
 
@@ -14,8 +21,6 @@ async function fetchBinanceMidPrice(token0Symbol, token1Symbol, date) {
     const binanceUrl = `https://data-api.binance.vision/api/v3/uiKlines?symbol=${symbol}&interval=1d&startTime=${startTime}&endTime=${endTime}`;
     console.log(binanceUrl);
     return null; // Return null if we couldn't get the mid price
-
-    
 }
 
 async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt = 1) {
@@ -24,6 +29,7 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
     let avgSwaps = [];
     let token0Symbol = "";
     let token1Symbol = "";
+    let tradeSizeUSD = [];
 
     let clock = startTimestamp;
     while (clock <= endTimestamp) {
@@ -43,6 +49,8 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
             token1 {
             symbol
             }
+            reserve0
+            reserve1
             swaps(
             orderBy: timestamp
             orderDirection: asc
@@ -55,7 +63,7 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
             amount1In
             amount0Out
             amount1Out
-            timestamp
+            timestamp   
             transaction {
                 id  
             }
@@ -73,34 +81,38 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
             token0Symbol = pair.token0.symbol;
             token1Symbol = pair.token1.symbol;
             const swaps = pair.swaps || [];
+            const reserve0 = parseFloat(pair.reserve0); // Token0 reserve in the pair
+            const reserve1 = parseFloat(pair.reserve1); // Token1 reserve in the pair
 
             let zero_to_one_total = 0;
             let zero_to_one_count = 0;
             let one_to_zero_total = 0;
             let one_to_zero_count = 0;
+
             swaps.forEach((swap, index) => {
                 const amount0In = parseFloat(swap.amount0In);
                 const amount1In = parseFloat(swap.amount1In);
                 const amount0Out = parseFloat(swap.amount0Out);
                 const amount1Out = parseFloat(swap.amount1Out);
-
+                let trueDirection = null;
                 let swapPrice = null;
                 let direction = "";
-               
+
                 if (amount0In > 0) {
                     swapPrice = amount1Out / amount0In;
                     direction = `${token0Symbol} → ${token1Symbol}`;
+                    trueDirection = true;
                     zero_to_one_total += swapPrice;
                     zero_to_one_count++;
-
                 } else if (amount1In > 0) {
                     swapPrice = amount0Out / amount1In;
                     direction = `${token1Symbol} → ${token0Symbol}`;
+                    trueDirection = false;
                     one_to_zero_total = swapPrice;
                     one_to_zero_count++;
                 }
 
-                //collect all data
+                // Collect all swap data
                 allSwaps.push({
                     ["Transaction ID"]: swap.transaction.id,
                     ["Date & Time"]: new Date(swap.timestamp * 1000).toISOString().replace('T', ' ').split('.')[0],
@@ -109,10 +121,23 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
                     [`${token1Symbol} In`]: amount1In,
                     [`${token1Symbol} Out`]: amount1Out,
                 });
-            });
 
-            // Calculate Binance mid price for the day
-            const binanceMidPrice = await fetchBinanceMidPrice(token0Symbol, token1Symbol, clock * 1000);
+                // Calculate trade size in USD
+                let tradeSizeInUSD = 0;
+                if (amount0In > 0) {
+                    tradeSizeInUSD = amount0In * (reserve1 / reserve0); // Price of token0 in terms of token1
+                } else if (amount1In > 0) {
+                    tradeSizeInUSD = amount1In * (reserve0 / reserve1); // Price of token1 in terms of token0
+                }
+
+                tradeSizeUSD.push({
+                    ["Transaction ID"]: swap.transaction.id,
+                    ["Date & Time"]: new Date(swap.timestamp * 1000).toISOString().replace('T', ' ').split('.')[0],
+                    ["Direction"]: direction,
+                    ["Trade Size (USD)"]: tradeSizeInUSD,
+                    ["True Direction"]: trueDirection,
+                });
+            });
 
             // Calculate averages for console log
             let zero_to_one_avg = zero_to_one_total / zero_to_one_count;
@@ -127,7 +152,6 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
                 Date: readableTimestamp,
                 [`${token0Symbol}/${token1Symbol} Average`]: zero_to_one_avg,
                 [`${token1Symbol}/${token0Symbol} Average`]: one_to_zero_avg,
-                [`Binance Mid Price`]: binanceMidPrice || 'N/A',
             });
 
         } catch (error) { 
@@ -137,42 +161,83 @@ async function fetchSwaps(token0, token1, startTimestamp, endTimestamp, attempt 
         clock += 86400; // increment day
     }
 
-    // create downloadable csv for all swaps
+    // Create downloadable CSV for all swaps
     if (allSwaps.length > 0) {
-        const month = new Date(startTimestamp * 1000).toISOString().slice(0, 7); // YYYY-MM
-        const filename = `swaps_${month}_${token0Symbol}_${token1Symbol}.csv`;
+        const filename = `fetchSwaps.csv`;
         const csv = parse(allSwaps);
         fs.writeFileSync(filename, csv);
         console.log(`Saved monthly data to ${filename}`);
     }
 
-    // create downloadable csv for average swaps including Binance mid price
+    // Create downloadable CSV for average swaps including Binance mid price
     if (avgSwaps.length > 0) {
         const csv = parse(avgSwaps);
         fs.writeFileSync("avg.csv", csv);
         console.log("saved avg.csv");
     }
-}
 
-
-async function fetchBinanceSymbols() {
-    try {
-        const response = await fetch('https://data-api.binance.vision/api/v3/exchangeInfo');
-        const data = await response.json();
-        const symbols = data.symbols
-            .filter(symbol => symbol.status === 'TRADING') // Optional: filters only active symbols
-            .map(symbol => symbol.symbol); // Extracts the symbol
-        console.log(symbols); // Displays the list of symbols in the console
-    } catch (error) {
-        console.error('Error fetching data:', error);
+    if (tradeSizeUSD.length > 0) {
+        const tradeSizeCsv = parse(tradeSizeUSD);
+        fs.writeFileSync("trade_size_usd.csv", tradeSizeCsv);
+        console.log("Saved trade_size_usd.csv");
     }
 }
 
-// Example Query
-const token1 = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";  // ETH
-const token0 = "0xdac17f958d2ee523a2206206994597c13d831ec7";  // USDT
-const startTimestamp = 1704067200;  // Jan 1, 2024 (00:00 UTC)
-const endTimestamp = 1706745599;    // Jan 31, 2024 (23:59 UTC)
+const app = express();
+app.use(cors());
 
-//fetchSwaps(token0, token1, startTimestamp, endTimestamp);
-fetchBinanceSymbols();
+app.get("/avg-swaps", (req, res) => {
+  const results = [];
+  fs.createReadStream("avg.csv") // Make sure the CSV file exists
+    .pipe(csv())
+    .on("data", (data) => results.push(data))
+    .on("end", () => res.json(results));
+});
+
+app.get("/trade-size-vs-avg-cost", (req, res) => {
+    const tradeSizeData = [];
+    const avgData = [];
+  
+    // Read the avg.csv to get the average costs
+    fs.createReadStream("avg.csv")
+      .pipe(csv())
+      .on("data", (data) => avgData.push(data))
+      .on("end", () => {
+        // Read the trade_size_usd.csv to get the trade sizes
+        fs.createReadStream("trade_size_usd.csv")
+          .pipe(csv())
+          .on("data", (data) => {
+            // Match the trade size with the corresponding average cost based on date
+            const avgEntry = avgData.find((entry) => entry.Date === data["Date & Time"].split(" ")[0]);
+            if (avgEntry) {
+              const averageCostColumn = data["True Direction"] === "true" 
+                ? Object.values(avgEntry)[1]  
+                : Object.values(avgEntry)[2]; 
+  
+              tradeSizeData.push({
+                date: data["Date & Time"].split(" ")[0],
+                tradeSize: parseFloat(data["Trade Size (USD)"]),
+                averageCost: parseFloat(averageCostColumn),
+              });
+            }
+          })
+          .on("end", () => {
+            res.json(tradeSizeData); 
+          });
+      });
+});
+
+app.listen(5000, () => {
+  console.log("Server running on http://localhost:5000");
+});
+
+// Serve the .csv file
+app.get('/download-fetchSwaps', (req, res) => {
+  const filePath = path.join(__dirname, 'fetchSwaps.csv');
+  res.download(filePath, 'fetchSwaps.csv', (err) => {
+    if (err) {
+      console.error('Error while sending the file:', err);
+      res.status(500).send('Error downloading file');
+    }
+  });
+});
